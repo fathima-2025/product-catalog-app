@@ -1,177 +1,342 @@
-"""Rich text and beautiful formatting in the terminal."""
+# coding: utf-8
+"""
 
-import os
-from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
+    webencodings
+    ~~~~~~~~~~~~
 
-from ._extension import load_ipython_extension  # noqa: F401
+    This is a Python implementation of the `WHATWG Encoding standard
+    <http://encoding.spec.whatwg.org/>`. See README for details.
 
-__all__ = ["get_console", "reconfigure", "print", "inspect", "print_json"]
+    :copyright: Copyright 2012 by Simon Sapin
+    :license: BSD, see LICENSE for details.
 
-if TYPE_CHECKING:
-    from .console import Console
+"""
 
-# Global console used by alternative print
-_console: Optional["Console"] = None
+from __future__ import unicode_literals
 
-try:
-    _IMPORT_CWD = os.path.abspath(os.getcwd())
-except FileNotFoundError:
-    # Can happen if the cwd has been deleted
-    _IMPORT_CWD = ""
+import codecs
 
-
-def get_console() -> "Console":
-    """Get a global :class:`~rich.console.Console` instance. This function is used when Rich requires a Console,
-    and hasn't been explicitly given one.
-
-    Returns:
-        Console: A console instance.
-    """
-    global _console
-    if _console is None:
-        from .console import Console
-
-        _console = Console()
-
-    return _console
+from .labels import LABELS
 
 
-def reconfigure(*args: Any, **kwargs: Any) -> None:
-    """Reconfigures the global console by replacing it with another.
-
-    Args:
-        *args (Any): Positional arguments for the replacement :class:`~rich.console.Console`.
-        **kwargs (Any): Keyword arguments for the replacement :class:`~rich.console.Console`.
-    """
-    from pip._vendor.rich.console import Console
-
-    new_console = Console(*args, **kwargs)
-    _console = get_console()
-    _console.__dict__ = new_console.__dict__
+VERSION = '0.5.1'
 
 
-def print(
-    *objects: Any,
-    sep: str = " ",
-    end: str = "\n",
-    file: Optional[IO[str]] = None,
-    flush: bool = False,
-) -> None:
-    r"""Print object(s) supplied via positional arguments.
-    This function has an identical signature to the built-in print.
-    For more advanced features, see the :class:`~rich.console.Console` class.
+# Some names in Encoding are not valid Python aliases. Remap these.
+PYTHON_NAMES = {
+    'iso-8859-8-i': 'iso-8859-8',
+    'x-mac-cyrillic': 'mac-cyrillic',
+    'macintosh': 'mac-roman',
+    'windows-874': 'cp874'}
 
-    Args:
-        sep (str, optional): Separator between printed objects. Defaults to " ".
-        end (str, optional): Character to write at end of output. Defaults to "\\n".
-        file (IO[str], optional): File to write to, or None for stdout. Defaults to None.
-        flush (bool, optional): Has no effect as Rich always flushes output. Defaults to False.
+CACHE = {}
+
+
+def ascii_lower(string):
+    r"""Transform (only) ASCII letters to lower case: A-Z is mapped to a-z.
+
+    :param string: An Unicode string.
+    :returns: A new Unicode string.
+
+    This is used for `ASCII case-insensitive
+    <http://encoding.spec.whatwg.org/#ascii-case-insensitive>`_
+    matching of encoding labels.
+    The same matching is also used, among other things,
+    for `CSS keywords <http://dev.w3.org/csswg/css-values/#keywords>`_.
+
+    This is different from the :meth:`~py:str.lower` method of Unicode strings
+    which also affect non-ASCII characters,
+    sometimes mapping them into the ASCII range:
+
+        >>> keyword = u'Bac\N{KELVIN SIGN}ground'
+        >>> assert keyword.lower() == u'background'
+        >>> assert ascii_lower(keyword) != keyword.lower()
+        >>> assert ascii_lower(keyword) == u'bac\N{KELVIN SIGN}ground'
 
     """
-    from .console import Console
-
-    write_console = get_console() if file is None else Console(file=file)
-    return write_console.print(*objects, sep=sep, end=end)
+    # This turns out to be faster than unicode.translate()
+    return string.encode('utf8').lower().decode('utf8')
 
 
-def print_json(
-    json: Optional[str] = None,
-    *,
-    data: Any = None,
-    indent: Union[None, int, str] = 2,
-    highlight: bool = True,
-    skip_keys: bool = False,
-    ensure_ascii: bool = False,
-    check_circular: bool = True,
-    allow_nan: bool = True,
-    default: Optional[Callable[[Any], Any]] = None,
-    sort_keys: bool = False,
-) -> None:
-    """Pretty prints JSON. Output will be valid JSON.
+def lookup(label):
+    """
+    Look for an encoding by its label.
+    This is the spec’s `get an encoding
+    <http://encoding.spec.whatwg.org/#concept-encoding-get>`_ algorithm.
+    Supported labels are listed there.
 
-    Args:
-        json (str): A string containing JSON.
-        data (Any): If json is not supplied, then encode this data.
-        indent (int, optional): Number of spaces to indent. Defaults to 2.
-        highlight (bool, optional): Enable highlighting of output: Defaults to True.
-        skip_keys (bool, optional): Skip keys not of a basic type. Defaults to False.
-        ensure_ascii (bool, optional): Escape all non-ascii characters. Defaults to False.
-        check_circular (bool, optional): Check for circular references. Defaults to True.
-        allow_nan (bool, optional): Allow NaN and Infinity values. Defaults to True.
-        default (Callable, optional): A callable that converts values that can not be encoded
-            in to something that can be JSON encoded. Defaults to None.
-        sort_keys (bool, optional): Sort dictionary keys. Defaults to False.
+    :param label: A string.
+    :returns:
+        An :class:`Encoding` object, or :obj:`None` for an unknown label.
+
+    """
+    # Only strip ASCII whitespace: U+0009, U+000A, U+000C, U+000D, and U+0020.
+    label = ascii_lower(label.strip('\t\n\f\r '))
+    name = LABELS.get(label)
+    if name is None:
+        return None
+    encoding = CACHE.get(name)
+    if encoding is None:
+        if name == 'x-user-defined':
+            from .x_user_defined import codec_info
+        else:
+            python_name = PYTHON_NAMES.get(name, name)
+            # Any python_name value that gets to here should be valid.
+            codec_info = codecs.lookup(python_name)
+        encoding = Encoding(name, codec_info)
+        CACHE[name] = encoding
+    return encoding
+
+
+def _get_encoding(encoding_or_label):
+    """
+    Accept either an encoding object or label.
+
+    :param encoding: An :class:`Encoding` object or a label string.
+    :returns: An :class:`Encoding` object.
+    :raises: :exc:`~exceptions.LookupError` for an unknown label.
+
+    """
+    if hasattr(encoding_or_label, 'codec_info'):
+        return encoding_or_label
+
+    encoding = lookup(encoding_or_label)
+    if encoding is None:
+        raise LookupError('Unknown encoding label: %r' % encoding_or_label)
+    return encoding
+
+
+class Encoding(object):
+    """Reresents a character encoding such as UTF-8,
+    that can be used for decoding or encoding.
+
+    .. attribute:: name
+
+        Canonical name of the encoding
+
+    .. attribute:: codec_info
+
+        The actual implementation of the encoding,
+        a stdlib :class:`~codecs.CodecInfo` object.
+        See :func:`codecs.register`.
+
+    """
+    def __init__(self, name, codec_info):
+        self.name = name
+        self.codec_info = codec_info
+
+    def __repr__(self):
+        return '<Encoding %s>' % self.name
+
+
+#: The UTF-8 encoding. Should be used for new content and formats.
+UTF8 = lookup('utf-8')
+
+_UTF16LE = lookup('utf-16le')
+_UTF16BE = lookup('utf-16be')
+
+
+def decode(input, fallback_encoding, errors='replace'):
+    """
+    Decode a single string.
+
+    :param input: A byte string
+    :param fallback_encoding:
+        An :class:`Encoding` object or a label string.
+        The encoding to use if :obj:`input` does note have a BOM.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :return:
+        A ``(output, encoding)`` tuple of an Unicode string
+        and an :obj:`Encoding`.
+
+    """
+    # Fail early if `encoding` is an invalid label.
+    fallback_encoding = _get_encoding(fallback_encoding)
+    bom_encoding, input = _detect_bom(input)
+    encoding = bom_encoding or fallback_encoding
+    return encoding.codec_info.decode(input, errors)[0], encoding
+
+
+def _detect_bom(input):
+    """Return (bom_encoding, input), with any BOM removed from the input."""
+    if input.startswith(b'\xFF\xFE'):
+        return _UTF16LE, input[2:]
+    if input.startswith(b'\xFE\xFF'):
+        return _UTF16BE, input[2:]
+    if input.startswith(b'\xEF\xBB\xBF'):
+        return UTF8, input[3:]
+    return None, input
+
+
+def encode(input, encoding=UTF8, errors='strict'):
+    """
+    Encode a single string.
+
+    :param input: An Unicode string.
+    :param encoding: An :class:`Encoding` object or a label string.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :return: A byte string.
+
+    """
+    return _get_encoding(encoding).codec_info.encode(input, errors)[0]
+
+
+def iter_decode(input, fallback_encoding, errors='replace'):
+    """
+    "Pull"-based decoder.
+
+    :param input:
+        An iterable of byte strings.
+
+        The input is first consumed just enough to determine the encoding
+        based on the precense of a BOM,
+        then consumed on demand when the return value is.
+    :param fallback_encoding:
+        An :class:`Encoding` object or a label string.
+        The encoding to use if :obj:`input` does note have a BOM.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :returns:
+        An ``(output, encoding)`` tuple.
+        :obj:`output` is an iterable of Unicode strings,
+        :obj:`encoding` is the :obj:`Encoding` that is being used.
+
     """
 
-    get_console().print_json(
-        json,
-        data=data,
-        indent=indent,
-        highlight=highlight,
-        skip_keys=skip_keys,
-        ensure_ascii=ensure_ascii,
-        check_circular=check_circular,
-        allow_nan=allow_nan,
-        default=default,
-        sort_keys=sort_keys,
-    )
+    decoder = IncrementalDecoder(fallback_encoding, errors)
+    generator = _iter_decode_generator(input, decoder)
+    encoding = next(generator)
+    return generator, encoding
 
 
-def inspect(
-    obj: Any,
-    *,
-    console: Optional["Console"] = None,
-    title: Optional[str] = None,
-    help: bool = False,
-    methods: bool = False,
-    docs: bool = True,
-    private: bool = False,
-    dunder: bool = False,
-    sort: bool = True,
-    all: bool = False,
-    value: bool = True,
-) -> None:
-    """Inspect any Python object.
+def _iter_decode_generator(input, decoder):
+    """Return a generator that first yields the :obj:`Encoding`,
+    then yields output chukns as Unicode strings.
 
-    * inspect(<OBJECT>) to see summarized info.
-    * inspect(<OBJECT>, methods=True) to see methods.
-    * inspect(<OBJECT>, help=True) to see full (non-abbreviated) help.
-    * inspect(<OBJECT>, private=True) to see private attributes (single underscore).
-    * inspect(<OBJECT>, dunder=True) to see attributes beginning with double underscore.
-    * inspect(<OBJECT>, all=True) to see all attributes.
-
-    Args:
-        obj (Any): An object to inspect.
-        title (str, optional): Title to display over inspect result, or None use type. Defaults to None.
-        help (bool, optional): Show full help text rather than just first paragraph. Defaults to False.
-        methods (bool, optional): Enable inspection of callables. Defaults to False.
-        docs (bool, optional): Also render doc strings. Defaults to True.
-        private (bool, optional): Show private attributes (beginning with underscore). Defaults to False.
-        dunder (bool, optional): Show attributes starting with double underscore. Defaults to False.
-        sort (bool, optional): Sort attributes alphabetically. Defaults to True.
-        all (bool, optional): Show all attributes. Defaults to False.
-        value (bool, optional): Pretty print value. Defaults to True.
     """
-    _console = console or get_console()
-    from pip._vendor.rich._inspect import Inspect
+    decode = decoder.decode
+    input = iter(input)
+    for chunck in input:
+        output = decode(chunck)
+        if output:
+            assert decoder.encoding is not None
+            yield decoder.encoding
+            yield output
+            break
+    else:
+        # Input exhausted without determining the encoding
+        output = decode(b'', final=True)
+        assert decoder.encoding is not None
+        yield decoder.encoding
+        if output:
+            yield output
+        return
 
-    # Special case for inspect(inspect)
-    is_inspect = obj is inspect
-
-    _inspect = Inspect(
-        obj,
-        title=title,
-        help=is_inspect or help,
-        methods=is_inspect or methods,
-        docs=is_inspect or docs,
-        private=private,
-        dunder=dunder,
-        sort=sort,
-        all=all,
-        value=value,
-    )
-    _console.print(_inspect)
+    for chunck in input:
+        output = decode(chunck)
+        if output:
+            yield output
+    output = decode(b'', final=True)
+    if output:
+        yield output
 
 
-if __name__ == "__main__":  # pragma: no cover
-    print("Hello, **World**")
+def iter_encode(input, encoding=UTF8, errors='strict'):
+    """
+    “Pull”-based encoder.
+
+    :param input: An iterable of Unicode strings.
+    :param encoding: An :class:`Encoding` object or a label string.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+    :returns: An iterable of byte strings.
+
+    """
+    # Fail early if `encoding` is an invalid label.
+    encode = IncrementalEncoder(encoding, errors).encode
+    return _iter_encode_generator(input, encode)
+
+
+def _iter_encode_generator(input, encode):
+    for chunck in input:
+        output = encode(chunck)
+        if output:
+            yield output
+    output = encode('', final=True)
+    if output:
+        yield output
+
+
+class IncrementalDecoder(object):
+    """
+    “Push”-based decoder.
+
+    :param fallback_encoding:
+        An :class:`Encoding` object or a label string.
+        The encoding to use if :obj:`input` does note have a BOM.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+
+    """
+    def __init__(self, fallback_encoding, errors='replace'):
+        # Fail early if `encoding` is an invalid label.
+        self._fallback_encoding = _get_encoding(fallback_encoding)
+        self._errors = errors
+        self._buffer = b''
+        self._decoder = None
+        #: The actual :class:`Encoding` that is being used,
+        #: or :obj:`None` if that is not determined yet.
+        #: (Ie. if there is not enough input yet to determine
+        #: if there is a BOM.)
+        self.encoding = None  # Not known yet.
+
+    def decode(self, input, final=False):
+        """Decode one chunk of the input.
+
+        :param input: A byte string.
+        :param final:
+            Indicate that no more input is available.
+            Must be :obj:`True` if this is the last call.
+        :returns: An Unicode string.
+
+        """
+        decoder = self._decoder
+        if decoder is not None:
+            return decoder(input, final)
+
+        input = self._buffer + input
+        encoding, input = _detect_bom(input)
+        if encoding is None:
+            if len(input) < 3 and not final:  # Not enough data yet.
+                self._buffer = input
+                return ''
+            else:  # No BOM
+                encoding = self._fallback_encoding
+        decoder = encoding.codec_info.incrementaldecoder(self._errors).decode
+        self._decoder = decoder
+        self.encoding = encoding
+        return decoder(input, final)
+
+
+class IncrementalEncoder(object):
+    """
+    “Push”-based encoder.
+
+    :param encoding: An :class:`Encoding` object or a label string.
+    :param errors: Type of error handling. See :func:`codecs.register`.
+    :raises: :exc:`~exceptions.LookupError` for an unknown encoding label.
+
+    .. method:: encode(input, final=False)
+
+        :param input: An Unicode string.
+        :param final:
+            Indicate that no more input is available.
+            Must be :obj:`True` if this is the last call.
+        :returns: A byte string.
+
+    """
+    def __init__(self, encoding=UTF8, errors='strict'):
+        encoding = _get_encoding(encoding)
+        self.encode = encoding.codec_info.incrementalencoder(errors).encode
